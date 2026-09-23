@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -u
+
+warn() {
+  printf 'pi startup updater: %s\n' "$1" >&2
+}
+
+pi_bin=${1:-}
+if [[ -z "$pi_bin" || ! -x "$pi_bin" ]]; then
+  warn 'Pi executable is unavailable; cannot launch Pi.'
+  exit 127
+fi
+shift
+
+metadata_file=
+lock_fd=
+lock_held=0
+
+cleanup_metadata() {
+  if [[ -n "$metadata_file" ]]; then
+    rm -f -- "$metadata_file"
+    metadata_file=
+  fi
+}
+trap cleanup_metadata EXIT
+
+release_lock() {
+  if [[ -n "$lock_fd" ]]; then
+    if (( lock_held )); then
+      flock -u "$lock_fd" 2>/dev/null || :
+    fi
+    exec {lock_fd}>&-
+    lock_fd=
+    lock_held=0
+  fi
+}
+
+launch_pi() {
+  cleanup_metadata
+  release_lock
+  exec "$pi_bin" "$@"
+}
+
+# Auto-update only for a plain, foreground interactive launch outside Pi.
+if (( $# != 0 )) || [[ ! -t 0 || ! -t 1 ]] || [[ -n "${AI_AGENT:-}" || -n "${PI_CODING_AGENT:-}" ]]; then
+  launch_pi "$@"
+fi
+case "${PI_OFFLINE:-}" in
+  1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) launch_pi "$@" ;;
+esac
+
+agent_dir=${PI_CODING_AGENT_DIR:-"$HOME/.pi/agent"}
+case "$agent_dir" in
+  '~') agent_dir=$HOME ;;
+  '~/'*) agent_dir="$HOME/${agent_dir:2}" ;;
+esac
+lock_file="$agent_dir/.startup-auto-update.lock"
+if ! command -v flock >/dev/null 2>&1 || ! exec {lock_fd}>"$lock_file"; then
+  warn 'update lock is unavailable; skipping auto-update.'
+  launch_pi "$@"
+fi
+if ! flock -n "$lock_fd"; then
+  warn 'another startup update is running; skipping auto-update.'
+  launch_pi "$@"
+fi
+lock_held=1
+
+check_running_pi() {
+  local process_names process_name
+  process_names=$(ps -eo comm= 2>/dev/null) || return 2
+  while IFS= read -r process_name; do
+    [[ "$process_name" == pi || "$process_name" == pi-rpc ]] && return 1
+  done <<< "$process_names"
+  return 0
+}
+
+if check_running_pi; then
+  :
+else
+  process_status=$?
+  if (( process_status == 1 )); then
+    warn 'another Pi or Pi RPC session is active; skipping auto-update.'
+  else
+    warn 'could not check for active Pi sessions; skipping auto-update.'
+  fi
+  launch_pi "$@"
+fi
+
+# Ask this installed Pi version to resolve user-scoped package paths. Project
+# settings are intentionally excluded; the matching update commands use the
+# documented --no-approve override, which also ignores saved project trust.
+resolver_ok=1
+if ! metadata_file=$(mktemp "${TMPDIR:-/tmp}/pi-startup-update.XXXXXX" 2>/dev/null); then
+  warn 'could not create preflight metadata; falling back to a core-only update.'
+  resolver_ok=0
+fi
+npm_sources=()
+git_paths=()
+git_targets=()
+git_unknown=0
+if (( resolver_ok )); then
+  if ! command -v node >/dev/null 2>&1 || ! node --input-type=module - "$pi_bin" "$agent_dir" >"$metadata_file" 2>/dev/null <<'NODE'
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const [piBin, agentDir] = process.argv.slice(2);
+let packageRoot = dirname(realpathSync(piBin));
+while (packageRoot !== dirname(packageRoot) &&
+       !existsSync(join(packageRoot, 'dist/core/package-manager.js'))) {
+  packageRoot = dirname(packageRoot);
+}
+if (!existsSync(join(packageRoot, 'dist/core/package-manager.js'))) process.exit(2);
+const importModule = (path) => import(pathToFileURL(join(packageRoot, path)));
+const [{ SettingsManager }, { DefaultPackageManager }, { parseGitUrl }] = await Promise.all([
+  importModule('dist/core/settings-manager.js'),
+  importModule('dist/core/package-manager.js'),
+  importModule('dist/utils/git.js'),
+]);
+const cwd = process.cwd();
+const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+if (settingsManager.drainErrors().some((error) => error.scope === 'global')) process.exit(3);
+const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+for (const entry of settingsManager.getGlobalSettings().packages ?? []) {
+  const source = typeof entry === 'string' ? entry : entry?.source;
+  if (typeof source !== 'string') process.exit(4);
+  if (source.startsWith('npm:')) {
+    process.stdout.write(`npm\0${source}\0`);
+    continue;
+  }
+  const gitSource = parseGitUrl(source);
+  if (gitSource) {
+    const installedPath = packageManager.getInstalledPath(source, 'user');
+    if (installedPath) {
+      process.stdout.write(`git\0${installedPath}\0git-target\0${gitSource.ref ?? ''}\0`);
+    } else {
+      const expectedPath = packageManager.getGitInstallPath(gitSource, 'user');
+      try {
+        lstatSync(expectedPath);
+        process.stdout.write(`git\0${expectedPath}\0git-target\0${gitSource.ref ?? ''}\0`);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        let parent = dirname(expectedPath);
+        while (true) {
+          let parentStat;
+          try {
+            parentStat = lstatSync(parent);
+          } catch (parentError) {
+            if (parentError.code !== 'ENOENT') throw parentError;
+            const nextParent = dirname(parent);
+            if (nextParent === parent) throw parentError;
+            parent = nextParent;
+            continue;
+          }
+          if (parentStat.isSymbolicLink()) realpathSync(parent);
+          break;
+        }
+        process.stdout.write('git-missing\0\0');
+      }
+    }
+  }
+}
+NODE
+  then
+    resolver_ok=0
+    npm_sources=()
+    git_paths=()
+  else
+    while :; do
+      kind=
+      value=
+      if ! IFS= read -r -d '' kind; then
+        [[ -z "$kind" ]] || resolver_ok=0
+        break
+      fi
+      if ! IFS= read -r -d '' value; then
+        resolver_ok=0
+        break
+      fi
+      case "$kind" in
+        npm) npm_sources+=("$value") ;;
+        git)
+          if [[ -z "$value" ]]; then
+            git_unknown=1
+          else
+            git_paths+=("$value")
+            git_targets+=("")
+          fi
+          ;;
+        git-target)
+          if (( ${#git_targets[@]} == 0 )); then
+            resolver_ok=0
+          else
+            git_targets[${#git_targets[@]}-1]=$value
+          fi
+          ;;
+        git-missing) ;;
+        *) resolver_ok=0; break ;;
+      esac
+    done < "$metadata_file"
+    if (( ! resolver_ok )); then
+      npm_sources=()
+      git_paths=()
+    fi
+  fi
+fi
+
+git_state=clean
+if (( ! resolver_ok )); then
+  git_state=resolver-failed
+elif (( git_unknown )); then
+  git_state=unknown
+else
+  git_index=0
+  for repo in "${git_paths[@]}"; do
+    repo_root=$(cd -- "$repo" 2>/dev/null && pwd -P) || { git_state=unknown; break; }
+    top=$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null) || { git_state=unknown; break; }
+    top=$(cd -- "$top" 2>/dev/null && pwd -P) || { git_state=unknown; break; }
+    [[ "$repo_root" == "$top" ]] || { git_state=unknown; break; }
+    status=$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none 2>/dev/null) || { git_state=unknown; break; }
+    if [[ -n "$status" ]]; then
+      git_state=dirty
+      break
+    fi
+    # Ignored build/dependency dirs are also removed by `git clean -fdx`; keep them unsafe and never auto-clean here.
+    clean_preview=$(git -C "$repo_root" clean -ndfx 2>/dev/null) || { git_state=unknown; break; }
+    if [[ -n "$clean_preview" ]]; then
+      git_state=dirty
+      break
+    fi
+    target_ref=${git_targets[git_index]:-}
+    if [[ -n "$target_ref" ]]; then
+      # Pi fetches pinned refs into FETCH_HEAD; a local name may point elsewhere.
+      git_state=unknown
+      break
+    fi
+    upstream=$(git -C "$repo_root" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null) || { git_state=unknown; break; }
+    if [[ "$upstream" == origin/* && -n "${upstream#origin/}" ]]; then
+      target_ref='@{upstream}'
+    else
+      git_state=unknown
+      break
+    fi
+    # No ref fetch here: stale cached refs or movement before Pi's fetch leave a check/update race.
+    target_head=$(git -C "$repo_root" rev-parse --verify --end-of-options "${target_ref}^{commit}" 2>/dev/null) || { git_state=unknown; break; }
+    if git -C "$repo_root" merge-base --is-ancestor HEAD "$target_head" >/dev/null 2>&1; then
+      :
+    else
+      ancestry_status=$?
+      if (( ancestry_status == 1 )); then
+        git_state=ahead
+      else
+        git_state=unknown
+      fi
+      break
+    fi
+    (( git_index += 1 ))
+  done
+fi
+
+if check_running_pi; then
+  :
+else
+  process_status=$?
+  if (( process_status == 1 )); then
+    warn 'another Pi or Pi RPC session became active; skipping auto-update.'
+  else
+    warn 'could not recheck active Pi sessions; skipping auto-update.'
+  fi
+  launch_pi "$@"
+fi
+
+update_failed=0
+if [[ "$git_state" == clean ]]; then
+  if ! "$pi_bin" update --all --no-approve >/dev/null 2>&1; then
+    update_failed=1
+  fi
+elif [[ "$git_state" == resolver-failed ]]; then
+  warn 'configured packages could not be resolved; falling back to a core-only update.'
+  if ! "$pi_bin" update --self --no-approve >/dev/null 2>&1; then
+    update_failed=1
+  fi
+else
+  if [[ "$git_state" == dirty ]]; then
+    warn 'a configured Git checkout is dirty or has ignored files Pi would clean; skipping Git updates and updating only Pi core and npm packages.'
+  elif [[ "$git_state" == ahead ]]; then
+    warn 'a configured Git checkout has commits outside the Pi update target; skipping Git updates and updating only Pi core and npm packages.'
+  elif [[ "$git_state" == unknown ]]; then
+    warn 'a configured Git checkout could not be verified; skipping Git updates and updating only Pi core and npm packages.'
+  fi
+  for source in "${npm_sources[@]}"; do
+    if ! "$pi_bin" update "$source" --no-approve >/dev/null 2>&1; then
+      update_failed=1
+      break
+    fi
+  done
+  if (( ! update_failed )) && ! "$pi_bin" update --self --no-approve >/dev/null 2>&1; then
+    update_failed=1
+  fi
+fi
+
+if (( update_failed )); then
+  warn 'an update failed; starting the installed Pi executable.'
+fi
+launch_pi "$@"
