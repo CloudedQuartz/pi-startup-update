@@ -91,16 +91,13 @@ else
 fi
 
 run_update() {
-  local label=$1 status update_error
+  local label=$1 status
   shift
 
-  update_error=$("$pi_bin" update "$@" 2>&1 >/dev/null)
+  "$pi_bin" update "$@" >/dev/null
   status=$?
   if (( status != 0 )); then
     warn "Pi $label update failed (exit $status); starting the installed Pi executable."
-    if [[ -n "$update_error" ]]; then
-      printf '%s\n' "$update_error" >&2
-    fi
     return "$status"
   fi
 }
