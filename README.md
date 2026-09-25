@@ -1,62 +1,36 @@
 # pi-startup-update
 
-A Bash prelaunch wrapper for an ordinary interactive Pi launch. **This is not a Pi extension**: it runs before Pi starts and does not use Pi's extension API.
-
-It only attempts updates for a zero-argument `pi` launch with stdin and stdout attached to a TTY. Any Pi arguments—including package-management or update subcommands—are passed straight through without running update work. It also skips updates for noninteractive launches, AI-agent environments, and `PI_OFFLINE`. If an active `pi` or `pi-rpc` process is detected, it skips updating and launches the installed Pi executable. Process checks are best-effort, not a lock coordinated with every Pi launch: another session could start after the final check, and direct launches do not share the wrapper's lock.
+A small Pi extension that awaits Pi's own `update --all --no-approve` from `session_start` on a plain interactive startup. It does not reload the running session, so updated code takes effect on the next launch.
 
 ## Install
 
-Copy the script into the user-level agent bin directory:
+Copy the extension into the user extension directory; no settings change or shell wrapper is needed:
 
 ```sh
-mkdir -p "$HOME/.pi/agent/bin"
-install -m 755 pi-startup-update "$HOME/.pi/agent/bin/pi-startup-update"
-```
-
-Add this function to `~/.zshrc` (or adapt it for your shell). It resolves Pi from the current `PATH` and falls back to launching Pi directly if the wrapper is absent:
-
-```zsh
-pi() {
-  local pi_bin updater
-  pi_bin="$(whence -p pi)"
-  if [[ -z "$pi_bin" || ! -x "$pi_bin" ]]; then
-    print -u2 -- "pi: executable not found on PATH"
-    return 127
-  fi
-
-  updater="$HOME/.pi/agent/bin/pi-startup-update"
-  if [[ -x "$updater" ]]; then
-    "$updater" "$pi_bin" "$@"
-  else
-    "$pi_bin" "$@"
-  fi
-}
+mkdir -p "$HOME/.pi/agent/extensions"
+install -m 644 startup-update.ts "$HOME/.pi/agent/extensions/startup-update.ts"
 ```
 
 ## Update behavior
 
-Updates run only for a zero-argument interactive launch, after a nonblocking `flock` and two best-effort checks for active `pi`/`pi-rpc` processes. The final check happens immediately before updating. Direct Pi launches do not share this lock, so this is not a guarantee against another session starting after that check.
+The awaited `session_start` handler runs only for a plain, zero-argument TUI startup. It skips reloads, non-TUI modes, `PI_OFFLINE`, nested `PI_SESSION_ID` sessions, and starts with CLI arguments. It deliberately does not skip on `AI_AGENT` or `PI_CODING_AGENT`, which Pi sets for its own active process.
 
-The wrapper invokes the installed Pi executable in order:
+This requires a Node-based Pi CLI, `ps`, and `flock`; compiled Bun binaries are not supported. Before updating, it checks for other `pi`/`pi-rpc` processes and Node-based Pi CLI processes, excluding its own PID. It skips on inspection errors, unusable process-list output, or another detected session. The check is best-effort: another Pi session can start immediately afterward, and `flock` serializes updater runs but does not lock ordinary Pi sessions.
+
+The extension invokes the current Node CLI entry directly, without a shell or `pi` wrapper. Pi's `update` command does not load extensions, so this cannot recursively trigger the handler:
 
 ```sh
-pi update --extensions --no-approve
-pi update --self --no-approve
+flock -n -E 75 <agent-dir>/.startup-auto-update.lock <node> <pi-cli-entry> update --all --no-approve
 ```
 
-The first command delegates user-scoped extension/package updates to Pi; the second updates Pi itself. The wrapper does not resolve package metadata, inspect Git status, or run a custom per-package update loop. `--no-approve` is retained to avoid approval prompts and exclude untrusted project packages under Pi's own update policy. This CLI is verified with Pi 0.87.1; older versions must support `update --extensions`.
+Pi 0.87.1's `--all` update handles packages and core together; package-update failure prevents the core update. The extension does not print updater output or retry in the same session. It leaves the current session running and reports only a generic status on failure or interruption. Successful updates take effect on the next launch; the running session is not reloaded.
 
-**Pi's normal package-update behavior can destroy local data.** Updating a Git package may reset its checkout (`git reset --hard`), remove untracked and ignored files (`git clean -fdx`), then reinstall it. Local edits and generated files inside updated package directories are not preserved. The wrapper intentionally does not add a Git-status safety gate. Pi does not provide a hard atomicity or rollback guarantee: a failed update may leave packages partially changed. If the extension update fails, the wrapper warns with error output streamed live on stderr, skips the core update, and launches the installed Pi. A core-update failure also warns and launches the installed executable.
-
-Runtime requirements are Bash, `ps`, and `flock`; if the lock is unavailable, updates are skipped and Pi is launched. The wrapper uses the installed Pi executable and local utilities; it does not invoke external AI tools or models.
+**This mutates the live Pi installation during startup.** A direct session can still start after the process scan, so it may overlap with package or core replacement. Pi's normal package updater may replace Git package contents, reset checkouts, or remove untracked and ignored files; failures may leave partial changes. Local package data can be lost, so back up anything you need.
 
 ## Tests
 
-Run the isolated mock-based tests with Node.js:
+Run the isolated tests with Node.js 24. They mock the Pi API, process scan, and lock command; the bundled-path case covers Node's `dist/bundle/cli.js`, not a compiled Bun binary. Tests never run a live updater:
 
 ```sh
-bash -n pi-startup-update
-node --test tests/pi-startup-update.test.mjs
+node --experimental-strip-types --test tests/startup-update.test.mjs
 ```
-
-The tests use temporary fixtures, a mocked Pi executable, and mocked process/lock checks. They do not run a live updater. `script` is required to provide a pseudo-terminal for the interactive-launch cases.
