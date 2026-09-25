@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function startupUpdate(pi: ExtensionAPI): void {
-	pi.on("session_start", async (event, ctx) => {
+	// Synchronous handler: the update is fire-and-forget so Pi's startup does not wait.
+	pi.on("session_start", (event, ctx) => {
 		// Only fresh TUI startups; /reload, in-session switches, and non-TUI modes skip.
 		if (event.reason !== "startup" || ctx.mode !== "tui") return;
 
@@ -11,15 +12,18 @@ export default function startupUpdate(pi: ExtensionAPI): void {
 			return;
 		}
 
-		try {
-			const result = await pi.exec(process.execPath, [cliEntry, "update", "--all", "--no-approve"]);
-			if (result.code === 0) {
-				ctx.ui.notify("Pi startup update completed; changes take effect on the next launch.", "info");
-			} else {
-				ctx.ui.notify(`Pi startup update failed (exit ${result.code}); this session will continue.`, "warning");
-			}
-		} catch (error) {
-			ctx.ui.notify(`Pi startup update could not run: ${String(error)}`, "warning");
-		}
+		// Completion is not guaranteed if Pi exits before the updater finishes.
+		void pi
+			.exec(process.execPath, [cliEntry, "update", "--all", "--no-approve"])
+			.then((result) => {
+				if (result.code === 0) {
+					ctx.ui.notify("Pi startup update completed; changes take effect on the next launch.", "info");
+				} else {
+					ctx.ui.notify(`Pi startup update failed (exit ${result.code}); this session will continue.`, "warning");
+				}
+			})
+			.catch((error) => {
+				ctx.ui.notify(`Pi startup update could not run: ${String(error)}`, "warning");
+			});
 	});
 }
