@@ -12,18 +12,12 @@ export default function startupUpdate(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Completion is not guaranteed if Pi exits before the updater finishes.
-		void pi
-			.exec(process.execPath, [cliEntry, "update", "--all", "--no-approve"])
-			.then((result) => {
-				if (result.code === 0) {
-					ctx.ui.notify("Pi startup update completed; changes take effect on the next launch.", "info");
-				} else {
-					ctx.ui.notify(`Pi startup update failed (exit ${result.code}); this session will continue.`, "warning");
-				}
-			})
-			.catch((error) => {
-				ctx.ui.notify(`Pi startup update could not run: ${String(error)}`, "warning");
-			});
+		// A later session or /reload makes ctx stale; never use it after this handler returns.
+		void pi.exec(process.execPath, [cliEntry, "update", "--all", "--no-approve"]).then(
+			(result) => {
+				if (result.code !== 0) console.error(`Pi startup update failed (exit ${result.code}).`);
+			},
+			(error) => console.error("Pi startup update could not run:", error),
+		);
 	});
 }

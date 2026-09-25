@@ -56,25 +56,24 @@ test("startup in TUI runs the builtin updater with --all --no-approve", async ()
 		args: [process.argv[1], "update", "--all", "--no-approve"],
 	}]);
 	await flush();
-	assert.deepEqual(harness.notifications, [[
-		"Pi startup update completed; changes take effect on the next launch.", "info",
-	]]);
+	assert.deepEqual(harness.notifications, []);
 });
 
-test("handler returns before the updater settles and notifies later", async () => {
-	const deferred = createDeferred();
-	const harness = createHarness({ deferred });
-	const returned = harness.handler({ reason: "startup" }, harness.context);
-	assert.equal(returned, undefined);
-	assert.equal(harness.calls.length, 1);
-	assert.deepEqual(harness.notifications, []);
-	await flush();
-	assert.deepEqual(harness.notifications, []);
-	deferred.resolve(success);
-	await flush();
-	assert.deepEqual(harness.notifications, [[
-		"Pi startup update completed; changes take effect on the next launch.", "info",
-	]]);
+test("handler returns before the updater settles and never uses a stale ctx", async (t) => {
+	const errors = t.mock.method(console, "error", () => {});
+	for (const outcome of ["nonzero", "rejected"]) {
+		const deferred = createDeferred();
+		const harness = createHarness({ deferred });
+		const returned = harness.handler({ reason: "startup" }, harness.context);
+		assert.equal(returned, undefined);
+		assert.equal(harness.calls.length, 1);
+		Object.defineProperty(harness.context, "ui", { get: () => { throw new Error("stale ctx"); } });
+		if (outcome === "nonzero") deferred.resolve({ ...success, code: 23 });
+		else deferred.reject(new Error("update failed"));
+		await flush();
+		assert.deepEqual(harness.notifications, []);
+	}
+	assert.equal(errors.mock.callCount(), 2);
 });
 
 test("skips reloads, in-session switches, and non-TUI modes", async () => {
@@ -92,24 +91,26 @@ test("skips reloads, in-session switches, and non-TUI modes", async () => {
 	}
 });
 
-test("reports a nonzero updater exit without exposing subprocess output", async () => {
+test("logs a nonzero updater exit without exposing subprocess output", async (t) => {
+	const errors = t.mock.method(console, "error", () => {});
 	const harness = createHarness({ result: { ...success, code: 23, stderr: "secret updater output" } });
 	harness.handler({ reason: "startup" }, harness.context);
 	assert.equal(harness.calls.length, 1);
 	await flush();
-	assert.deepEqual(harness.notifications, [[
-		"Pi startup update failed (exit 23); this session will continue.", "warning",
-	]]);
-	assert.doesNotMatch(JSON.stringify(harness.notifications), /secret/);
+	assert.equal(errors.mock.callCount(), 1);
+	assert.match(errors.mock.calls[0].arguments[0], /exit 23/);
+	assert.doesNotMatch(JSON.stringify(errors.mock.calls), /secret/);
+	assert.deepEqual(harness.notifications, []);
 });
 
-test("reports an exec exception instead of swallowing it", async () => {
+test("logs an exec exception instead of swallowing it", async (t) => {
+	const errors = t.mock.method(console, "error", () => {});
 	const harness = createHarness({ throwExec: true });
 	harness.handler({ reason: "startup" }, harness.context);
 	assert.equal(harness.calls.length, 1);
 	await flush();
-	assert.equal(harness.notifications.length, 1);
-	assert.equal(harness.notifications[0][1], "warning");
-	assert.match(harness.notifications[0][0], /could not run/);
-	assert.match(harness.notifications[0][0], /mock exec failure/);
+	assert.equal(errors.mock.callCount(), 1);
+	assert.match(errors.mock.calls[0].arguments[0], /could not run/);
+	assert.match(errors.mock.calls[0].arguments[1].message, /mock exec failure/);
+	assert.deepEqual(harness.notifications, []);
 });

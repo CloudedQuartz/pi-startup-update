@@ -23,7 +23,7 @@ node <pi-cli-entry> update --all --no-approve
 
 The `session_start` handler is synchronous: it starts the update and returns immediately, so Pi's startup does not wait for it. The update runs asynchronously in the background while the session continues. If Pi exits before the updater finishes, completion is not guaranteed — the update may be partial or not applied at all.
 
-Pi 0.87.1's `--all` updates the core and installed packages together. When the background update finishes, a nonzero exit or a spawn failure produces a warning notification; success produces one informational notice. The running session is never reloaded or interrupted, and the update is never retried within the same session.
+Pi 0.87.1's `--all` updates the core and installed packages together. A failed update is logged to stderr; success is silent. Completion callbacks never use the extension context, which may be stale after a reload or session switch. The extension does not reload the running session or retry the update.
 
 **This mutates the live Pi installation during startup with no hard guarantees.** In-session updates can race across concurrent Pi sessions: another session may start while the update runs, and Pi's package updater may replace Git package contents, reset checkouts, or remove untracked files. Failures can leave partial changes, so back up anything you need. The update is best-effort — the session continues either way, and changes apply on the next launch.
 
