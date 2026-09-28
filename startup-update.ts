@@ -12,6 +12,7 @@ export default function startupUpdate(pi: ExtensionAPI): void {
 			return;
 		}
 
+		ctx.ui.notify("Pi auto-update started in the background.", "info");
 		// A later session or /reload makes ctx stale; never use it after this handler returns.
 		void pi.exec(process.execPath, [cliEntry, "update", "--all", "--no-approve"]).then(
 			(result) => {
